@@ -12,6 +12,7 @@ export interface Env {
   HIDE_HIDDEN_FILES?: boolean;
   DIRECTORY_CACHE_CONTROL?: string;
   LOGGING?: boolean;
+  PAGINATION?: boolean; // New environment variable for pagination
 }
 
 const units = ["B", "KB", "MB", "GB", "TB"];
@@ -38,8 +39,53 @@ function getRangeHeader(range: ParsedRange, fileSize: number): string {
   }/${fileSize}`;
 }
 
-// some ideas for this were taken from / inspired by
-// https://github.com/cloudflare/workerd/blob/main/samples/static-files-from-disk/static.js
+async function fetchAllListingItems(
+  path: string, 
+  env: Env
+): Promise<{ 
+  delimitedPrefixes: string[], 
+  objects: R2Object[], 
+  lastModified: Date | null 
+}> {
+  let cursor: string | undefined = undefined;
+  const allDelimitedPrefixes: string[] = [];
+  const allObjects: R2Object[] = [];
+  let lastModified: Date | null = null;
+
+  do {
+    const listing = await env.R2_BUCKET.list({
+      prefix: path,
+      delimiter: "/",
+      cursor,
+      limit: 1000,
+    });
+
+    // Add prefixes
+    for (const dir of listing.delimitedPrefixes) {
+      if (!allDelimitedPrefixes.includes(dir)) {
+        allDelimitedPrefixes.push(dir);
+      }
+    }
+
+    // Add objects and track last modified
+    for (const file of listing.objects) {
+      allObjects.push(file);
+      if (lastModified == null || file.uploaded > lastModified) {
+        lastModified = file.uploaded;
+      }
+    }
+
+    // Update cursor for next iteration
+    cursor = listing.truncated ? listing.cursor : undefined;
+  } while (cursor);
+
+  return { 
+    delimitedPrefixes: allDelimitedPrefixes, 
+    objects: allObjects, 
+    lastModified 
+  };
+}
+
 async function makeListingResponse(
   path: string,
   env: Env,
@@ -49,20 +95,42 @@ async function makeListingResponse(
   else if (path !== "" && !path.endsWith("/")) {
     path += "/";
   }
+
   let cursor = new URL(request.url).searchParams.get("cursor") || undefined;
-  let listing = await env.R2_BUCKET.list({
-    prefix: path,
-    delimiter: "/",
-    cursor,
-    limit: env.ITEMS_PER_PAGE || 1000,
-  });
+  
+  // Determine listing method based on PAGINATION setting
+  let listing: { 
+    delimitedPrefixes: string[], 
+    objects: R2Object[], 
+    truncated?: boolean, 
+    cursor?: string,
+    lastModified: Date | null 
+  };
+
+  if (env.PAGINATION === false) {
+    // Fetch all items if pagination is disabled
+    const result = await fetchAllListingItems(path, env);
+    listing = {
+      ...result,
+      truncated: false,
+      cursor: undefined
+    };
+  } else {
+    // Use standard pagination
+    listing = await env.R2_BUCKET.list({
+      prefix: path,
+      delimiter: "/",
+      cursor,
+      limit: env.ITEMS_PER_PAGE || 1000,
+    });
+  }
 
   if (listing.delimitedPrefixes.length === 0 && listing.objects.length === 0) {
     return null;
   }
 
   let html: string = "";
-  let lastModified: Date | null = null;
+  let lastModified: Date | null = listing.lastModified;
 
   if (request.method === "GET") {
     let htmlList = [];
@@ -85,9 +153,17 @@ async function makeListingResponse(
           `<td>-</td><td>-</td></tr>`
       );
     }
-    for (let file of listing.objects) {
+
+    // Sort objects for consistent display
+    const sortedObjects = listing.objects
+      .filter(file => {
+        let name = file.key.substring(path.length, file.key.length);
+        return !(name.startsWith(".") && env.HIDE_HIDDEN_FILES);
+      })
+      .sort((a, b) => a.key.localeCompare(b.key));
+
+    for (let file of sortedObjects) {
       let name = file.key.substring(path.length, file.key.length);
-      if (name.startsWith(".") && env.HIDE_HIDDEN_FILES) continue;
 
       let dateStr = file.uploaded.toISOString();
       dateStr = dateStr.split(".")[0].replace("T", " ");
@@ -98,13 +174,10 @@ async function makeListingResponse(
           `<td><a href="${encodeURIComponent(name)}">${name}</a></td>` +
           `<td>${dateStr}</td><td>${niceBytes(file.size)}</td></tr>`
       );
-
-      if (lastModified == null || file.uploaded > lastModified) {
-        lastModified = file.uploaded;
-      }
     }
 
-    if (listing.truncated) {
+    // Add pagination link if truncated and pagination is enabled
+    if (listing.truncated && env.PAGINATION !== false) {
       htmlList.push(
         `      <tr>` +
           `<td><a href="?cursor=${listing.cursor}">...see more.../</a></td>` +
